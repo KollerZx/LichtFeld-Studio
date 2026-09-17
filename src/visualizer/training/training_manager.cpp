@@ -614,6 +614,40 @@ namespace lfs::vis {
         return true;
     }
 
+    std::shared_lock<std::shared_mutex> TrainerManager::acquireLiveModelReadLock() const {
+        assert(trainer_ && "acquireLiveModelReadLock requires an installed trainer");
+        std::shared_mutex& mutex = trainer_->getRenderMutex();
+        std::shared_lock<std::shared_mutex> lock(mutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            return lock;
+        }
+        const bool on_viewer_thread = viewer_ && viewer_->isOnViewerThread();
+        if (!on_viewer_thread) {
+            // Worker threads cannot service the viewer queue; a plain blocking
+            // acquire is safe for them.
+            lock.lock();
+            return lock;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        bool stall_logged = false;
+        while (!lock.try_lock()) {
+            // The training step that owns the exclusive lock may be waiting on
+            // us (growExportableForDensify posts the Vulkan chunk bind to the
+            // viewer thread and waits for it). Drain that work here so it can
+            // finish and release the mutex.
+            if (!viewer_->pumpPostedWorkForProjectWrite()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+            }
+            if (!stall_logged &&
+                std::chrono::steady_clock::now() - started > std::chrono::seconds(5)) {
+                stall_logged = true;
+                LOG_WARN("Viewer thread has waited >5s for the live-model read lock "
+                         "(training step still holds it exclusively)");
+            }
+        }
+        return lock;
+    }
+
     bool TrainerManager::growExportableForDensify(std::size_t needed_rows) {
         if (!splat_storage_ || !splat_storage_->valid()) {
             return false;
@@ -2529,15 +2563,17 @@ namespace lfs::vis {
         if (!trainer_)
             return;
 
-        if (trainer_->isInitialized() && trainer_->getParams().resume_checkpoint.has_value()) {
-            if (auto* const param_mgr = services().paramsOrNull()) {
-                auto params = trainer_->getParams();
-                params.optimization.save_steps = param_mgr->copyActiveParams().save_steps;
-                trainer_->setParams(params);
-                param_mgr->importTrainingParams(params);
+        if (trainer_->isInitialized()) {
+            auto params = trainer_->getParams();
+            if (params.resume_checkpoint.has_value() || params.resume_project.has_value()) {
+                if (auto* const param_mgr = services().paramsOrNull()) {
+                    params.optimization.save_steps = param_mgr->copyActiveParams().save_steps;
+                    trainer_->setParams(params);
+                    param_mgr->importTrainingParams(params);
+                }
+                LOG_DEBUG("Ignoring parameter updates for checkpoint/project-backed trainer (save steps kept)");
+                return;
             }
-            LOG_DEBUG("Ignoring parameter updates for checkpoint-backed trainer (save steps kept)");
-            return;
         }
 
         const auto previous_params = trainer_->getParams();

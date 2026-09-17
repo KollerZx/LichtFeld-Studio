@@ -227,6 +227,127 @@ namespace lfs::training::kernels {
         LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.long_axis_split_inplace");
     }
 
+    __global__ void sanitize_gaussians_inplace_kernel(
+        float* __restrict__ positions,
+        float* __restrict__ rotations,
+        float* __restrict__ scales,
+        float* __restrict__ sh0,
+        float* __restrict__ shN,
+        float* __restrict__ opacities,
+        const int64_t* __restrict__ indices,
+        int count,
+        int shN_dim,
+        float safe_log_scale,
+        float safe_raw_opacity,
+        int* __restrict__ sanitized_count) {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= count)
+            return;
+
+        const int64_t row = indices ? indices[i] : static_cast<int64_t>(i);
+
+        bool bad = !isfinite(opacities[row]);
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            bad = bad || !isfinite(positions[row * 3 + k]) ||
+                  !isfinite(scales[row * 3 + k]) ||
+                  !isfinite(sh0[row * 3 + k]);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            bad = bad || !isfinite(rotations[row * 4 + k]);
+        }
+        for (int k = 0; k < shN_dim; ++k) {
+            bad = bad || !isfinite(shN[row * static_cast<int64_t>(shN_dim) + k]);
+        }
+        if (!bad)
+            return;
+
+        positions[row * 3 + 0] = 0.0f;
+        positions[row * 3 + 1] = 0.0f;
+        positions[row * 3 + 2] = 0.0f;
+
+        rotations[row * 4 + 0] = 0.0f;
+        rotations[row * 4 + 1] = 0.0f;
+        rotations[row * 4 + 2] = 0.0f;
+        rotations[row * 4 + 3] = 1.0f;
+
+        scales[row * 3 + 0] = safe_log_scale;
+        scales[row * 3 + 1] = safe_log_scale;
+        scales[row * 3 + 2] = safe_log_scale;
+
+        opacities[row] = safe_raw_opacity;
+
+        sh0[row * 3 + 0] = 0.0f;
+        sh0[row * 3 + 1] = 0.0f;
+        sh0[row * 3 + 2] = 0.0f;
+
+        for (int k = 0; k < shN_dim; ++k) {
+            shN[row * static_cast<int64_t>(shN_dim) + k] = 0.0f;
+        }
+
+        if (sanitized_count) {
+            atomicAdd(sanitized_count, 1);
+        }
+    }
+
+    void launch_sanitize_gaussians_inplace(
+        float* positions,
+        float* rotations,
+        float* scales,
+        float* sh0,
+        float* shN,
+        float* opacities,
+        const int64_t* indices,
+        int count,
+        int shN_dim,
+        float safe_log_scale,
+        float safe_raw_opacity,
+        int* sanitized_count,
+        cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        if (count == 0)
+            return;
+
+        const int block_size = 256;
+        const int num_blocks = (count + block_size - 1) / block_size;
+
+        sanitize_gaussians_inplace_kernel<<<num_blocks, block_size, 0, stream>>>(
+            positions, rotations, scales, sh0, shN, opacities,
+            indices, count, shN_dim, safe_log_scale, safe_raw_opacity,
+            sanitized_count);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.densify.sanitize_gaussians_inplace");
+    }
+
+    __global__ void count_non_finite_kernel(
+        const float* __restrict__ data,
+        size_t count,
+        float* __restrict__ out_count) {
+        const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+        int local_bad = 0;
+        for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
+            local_bad += isfinite(data[i]) ? 0 : 1;
+        }
+        if (local_bad != 0) {
+            atomicAdd(out_count, static_cast<float>(local_bad));
+        }
+    }
+
+    void launch_count_non_finite(
+        const float* data,
+        size_t count,
+        float* out_count,
+        cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        if (count == 0 || data == nullptr || out_count == nullptr)
+            return;
+        const int block_size = 256;
+        const size_t wanted_blocks = (count + block_size - 1) / block_size;
+        const int num_blocks = static_cast<int>(wanted_blocks < 4096 ? wanted_blocks : 4096);
+        count_non_finite_kernel<<<num_blocks, block_size, 0, stream>>>(data, count, out_count);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.diag.count_non_finite");
+    }
+
     __global__ void fill_free_slots_fused_kernel(
         const int64_t* __restrict__ target_indices,
         size_t n_fill,

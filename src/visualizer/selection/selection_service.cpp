@@ -186,8 +186,8 @@ namespace lfs::vis {
             const SceneManager* const scene_manager) {
             std::optional<std::shared_lock<std::shared_mutex>> lock;
             if (const auto* tm = scene_manager ? scene_manager->getTrainerManager() : nullptr) {
-                if (const auto* trainer = tm->getTrainer()) {
-                    lock.emplace(trainer->getRenderMutex());
+                if (tm->getTrainer()) {
+                    lock.emplace(tm->acquireLiveModelReadLock());
                 }
             }
             return lock;

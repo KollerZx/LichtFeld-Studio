@@ -290,6 +290,7 @@ namespace lfs::training {
         GumbelTopKScratch _gumbel_scratch;
         PositiveMedianScratch _median_scratch;
         lfs::core::Tensor _refine_counts_dev;
+        lfs::core::Tensor _sanitize_count_dev;
 
         std::size_t _strategy_required_peak_bytes = 0;
         std::size_t _strategy_allocated_peak_bytes = 0;

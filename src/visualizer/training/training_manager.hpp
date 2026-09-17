@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <stop_token>
 #include <thread>
@@ -175,6 +176,16 @@ namespace lfs::vis {
         // Access to trainer (for rendering, etc.)
         lfs::training::Trainer* getTrainer() { return trainer_.get(); }
         const lfs::training::Trainer* getTrainer() const { return trainer_.get(); }
+
+        // Shared (read) lock on the live training model's render mutex that is
+        // safe to take from the viewer thread. A refining training step holds
+        // this mutex exclusively and may need the viewer thread to execute posted
+        // work before it can release it (e.g. binding new exportable Vulkan chunks
+        // when the model grows). A plain blocking shared_lock on the viewer thread
+        // would therefore deadlock the whole application. While the mutex is
+        // contended this helper pumps the posted-work queue (viewer thread only)
+        // and retries instead of blocking. Requires getTrainer() != nullptr.
+        [[nodiscard]] std::shared_lock<std::shared_mutex> acquireLiveModelReadLock() const;
 
         // Splat exportable storage — populated when training starts with a viewer
         // active. The viewer's vksplat renderer imports the same physical block

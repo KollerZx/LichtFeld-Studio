@@ -7912,6 +7912,18 @@ namespace lfs::vis::project {
                                             std::memory_order_acquire) ==
                                             epoch &&
                                         document_ == document) {
+                                        if (auto* const param_mgr =
+                                                viewer_.getParameterManager()) {
+                                            if (auto restored =
+                                                    param_mgr->restorePendingProjectState(
+                                                        report.pending_parameters);
+                                                !restored) {
+                                                LOG_WARN(
+                                                    "Could not restore saved training parameters, keeping defaults: {}",
+                                                    lfs::format_for_developer(
+                                                        restored.error()));
+                                            }
+                                        }
                                         captureStoredTrainingSession(
                                             report);
                                     }

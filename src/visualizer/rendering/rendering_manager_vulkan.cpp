@@ -161,8 +161,10 @@ namespace lfs::vis {
                         }
                         return LiveModelLockBundle(std::move(candidate), scene);
                     }
-                    return LiveModelLockBundle(
-                        std::shared_lock<std::shared_mutex>(trainer->getRenderMutex()), scene);
+                    // Blocking acquire on the viewer thread must keep servicing
+                    // posted work, otherwise a refining step that waits on the
+                    // viewer (exportable chunk bind) deadlocks the application.
+                    return LiveModelLockBundle(tm->acquireLiveModelReadLock(), scene);
                 }
             }
             return std::nullopt;

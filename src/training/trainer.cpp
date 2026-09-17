@@ -2099,7 +2099,8 @@ namespace lfs::training {
         }
         for (size_t i = 0; i < loss_slots_.size(); ++i) {
             loss_slots_[i].pinned = static_cast<float*>(
-                lfs::core::PinnedMemoryAllocator::instance().allocate(sizeof(float)));
+                lfs::core::PinnedMemoryAllocator::instance().allocate(
+                    LOSS_SLOT_FLOATS * sizeof(float)));
             LFS_ASSERT_MSG(
                 loss_slots_[i].pinned != nullptr,
                 std::format("Trainer loss slot {} pinned allocation failed", i));
@@ -2142,7 +2143,58 @@ namespace lfs::training {
         orphaned_sidecar_events_.clear();
     }
 
-    void Trainer::submitLossReadback(const lfs::core::Tensor& total_loss, int iter) {
+    void Trainer::recordStepCamera(int iter, const lfs::core::Camera* cam) {
+        auto& entry = recent_step_cameras_[recent_step_camera_head_];
+        entry.first = iter;
+        entry.second = cam ? cam->image_name() : std::string("<no camera>");
+        recent_step_camera_head_ = (recent_step_camera_head_ + 1) % RECENT_STEP_CAMERAS;
+    }
+
+    std::string Trainer::describeNonFiniteLossState(int failed_iter) {
+        std::string out;
+        // Views trained around the failing sample (the ring is in insertion
+        // order starting at the head).
+        out += "recent views:";
+        for (size_t i = 0; i < RECENT_STEP_CAMERAS; ++i) {
+            const auto& entry = recent_step_cameras_[(recent_step_camera_head_ + i) % RECENT_STEP_CAMERAS];
+            if (entry.first <= 0 || entry.second.empty())
+                continue;
+            out += std::format(" [{}{}:{}]",
+                               entry.first == failed_iter ? "*" : "",
+                               entry.first, entry.second);
+        }
+        if (!strategy_) {
+            return out;
+        }
+        try {
+            auto& model = strategy_->get_model();
+            const auto count_non_finite = [](const lfs::core::Tensor& t) -> long long {
+                if (!t.is_valid() || t.numel() == 0 ||
+                    t.dtype() != lfs::core::DataType::Float32) {
+                    return -1; // not inspected
+                }
+                return static_cast<long long>(
+                    t.isfinite().logical_not().to(lfs::core::DataType::Float32).sum().item());
+            };
+            out += std::format(
+                "; model non-finite counts (-1 = not inspected): means={} scaling={} rotation={} opacity={} sh0={} shN={} (size={})",
+                count_non_finite(model.means()),
+                count_non_finite(model.scaling_raw()),
+                count_non_finite(model.rotation_raw()),
+                count_non_finite(model.opacity_raw()),
+                count_non_finite(model.sh0()),
+                count_non_finite(model.shN()),
+                model.size());
+        } catch (const std::exception& e) {
+            out += std::format("; model scan failed: {}", e.what());
+        }
+        return out;
+    }
+
+    void Trainer::submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
+                                     const lfs::core::Camera* cam,
+                                     const float* trace_counts_dev,
+                                     std::array<size_t, 3> trace_numel) {
         LossReadbackSlot& slot = loss_slots_[loss_slot_head_];
         if (!slot.pinned || !slot.done) {
             return;
@@ -2160,8 +2212,15 @@ namespace lfs::training {
                             cudaMemcpyDeviceToHost, training_stream_) != cudaSuccess) {
             return;
         }
+        slot.has_trace = false;
+        if (trace_counts_dev) {
+            slot.has_trace = cudaMemcpyAsync(slot.pinned + 1, trace_counts_dev, 3 * sizeof(float),
+                                             cudaMemcpyDeviceToHost, training_stream_) == cudaSuccess;
+            slot.trace_numel = trace_numel;
+        }
         if (cudaEventRecord(slot.done, training_stream_) == cudaSuccess) {
             slot.iter = iter;
+            slot.image_name = cam ? cam->image_name() : std::string{};
             slot.in_flight = true;
             loss_slot_head_ = (loss_slot_head_ + 1) % LOSS_RING;
         }
@@ -2184,7 +2243,37 @@ namespace lfs::training {
             slot.in_flight = false;
 
             const float loss_value = *slot.pinned;
+            if (slot.has_trace) {
+                const float gt_bad = slot.pinned[1];
+                const float render_bad = slot.pinned[2];
+                const float loss_bad = slot.pinned[3];
+                const auto plausible = [](float v, size_t numel) {
+                    return std::isfinite(v) && v >= 0.0f && v <= static_cast<float>(numel);
+                };
+                if (!plausible(gt_bad, slot.trace_numel[0]) ||
+                    !plausible(render_bad, slot.trace_numel[1]) ||
+                    !plausible(loss_bad, slot.trace_numel[2])) {
+                    // The readback itself is corrupt (count exceeds the inspected
+                    // element count): report, but do not attribute a NaN to it.
+                    LOG_ERROR("NaN trace (async): implausible readback at iter={} view='{}' "
+                              "gt={}/{} render={}/{} loss={}/{} — trace buffer corrupted?",
+                              slot.iter, slot.image_name,
+                              gt_bad, slot.trace_numel[0], render_bad, slot.trace_numel[1],
+                              loss_bad, slot.trace_numel[2]);
+                } else if (gt_bad > 0.0f || render_bad > 0.0f || loss_bad > 0.0f) {
+                    LOG_ERROR("NaN trace (async): first non-finite step iter={} view='{}' "
+                              "gt_non_finite={} render_non_finite={} loss_non_finite={} loss={}; {}",
+                              slot.iter, slot.image_name, gt_bad, render_bad, loss_bad, loss_value,
+                              describeNonFiniteLossState(slot.iter));
+                    return std::unexpected(std::format("NaN/Inf detected by trace at iteration {}", slot.iter));
+                }
+            }
             if (std::isnan(loss_value) || std::isinf(loss_value)) {
+                // Diagnostics before aborting: which view produced the sample and
+                // whether the model itself is already corrupted.
+                LOG_ERROR("NaN/Inf loss detected at iteration {} (sampled view '{}', loss={}); {}",
+                          slot.iter, slot.image_name, loss_value,
+                          describeNonFiniteLossState(slot.iter));
                 return std::unexpected(std::format("NaN/Inf loss at iteration {}", slot.iter));
             }
 
@@ -3148,6 +3237,15 @@ namespace lfs::training {
 
     Trainer::~Trainer() {
         shutdown();
+        // Persistent GT ring (raw allocations outside the pool). shutdown() has
+        // already drained the training stream, so the slots are idle here.
+        for (auto& slot : gt_ring_) {
+            if (slot) {
+                (void)cudaFree(slot);
+                slot = nullptr;
+            }
+        }
+        gt_ring_slot_bytes_ = 0;
     }
 
     std::shared_ptr<lfs::io::PipelinedImageLoader> Trainer::getActiveImageLoader() const {
@@ -5855,6 +5953,7 @@ namespace lfs::training {
         std::stop_token stop_token) {
         StepPhase current_phase = StepPhase::Forward;
         bool persistent_commit = false;
+        recordStepCamera(iter, cam);
         const int prof_start = params_.optimization.profile_start_iter;
         const int prof_stop = params_.optimization.profile_stop_iter;
         const bool profile_window_active =
@@ -7729,11 +7828,49 @@ namespace lfs::training {
                     }
                 }
 
+                // Opt-in per-step NaN tracing (LFS_NAN_TRACE=1): finiteness
+                // counts of the ground truth, the rendered image and the loss, so
+                // a NaN can be attributed to the loader, the rasterizer or the
+                // loss/backward stage (the harvest side adds a scan of the model).
+                static const bool nan_trace_enabled = [] {
+                    const char* const v = std::getenv("LFS_NAN_TRACE");
+                    return v && *v && *v != '0';
+                }();
+                // The counts stay on the device and ride the loss readback ring
+                // (every iteration while tracing), so the pipeline is not stalled
+                // and stream races are not masked by a host synchronization.
+                std::array<size_t, 3> nan_trace_numel{};
+                if (nan_trace_enabled) {
+                    if (!nan_trace_counts_dev_.is_valid() || nan_trace_counts_dev_.numel() < 3) {
+                        nan_trace_counts_dev_ = lfs::core::Tensor::zeros(
+                            {3}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                    }
+                    float* const counts_dev = nan_trace_counts_dev_.ptr<float>();
+                    if (cudaMemsetAsync(counts_dev, 0, 3 * sizeof(float), training_stream_) != cudaSuccess) {
+                        LOG_WARN("NaN trace: counter reset failed; trace sample skipped");
+                    }
+                    // Dedicated kernel (no lazy-executor path, no temporaries) so
+                    // the accumulator is stable until the ring memcpy runs.
+                    const auto count_into = [&](const lfs::core::Tensor& t, size_t slot) {
+                        if (!t.is_valid() || t.numel() == 0 || !t.is_contiguous() ||
+                            t.dtype() != lfs::core::DataType::Float32) {
+                            nan_trace_numel[slot] = 0; // not inspected
+                            return;
+                        }
+                        nan_trace_numel[slot] = t.numel();
+                        kernels::launch_count_non_finite(t.ptr<float>(), t.numel(),
+                                                         counts_dev + slot, training_stream_);
+                    };
+                    count_into(gt_image, 0);
+                    count_into(r_output.image, 1);
+                    count_into(loss_tensor_gpu, 2);
+                }
+
                 // Loss readback at intervals, async: enqueue the D2H into the
                 // pinned ring and report harvested samples from earlier iterations
                 // — no pipeline stall.
                 constexpr int LOSS_SYNC_INTERVAL = 10;
-                if (iter % LOSS_SYNC_INTERVAL == 0 || iter == 1) {
+                if (iter % LOSS_SYNC_INTERVAL == 0 || iter == 1 || nan_trace_enabled) {
                     lfs::core::Tensor total_loss = sparsity_loss_gpu.numel() > 0
                                                        ? (loss_tensor_gpu + sparsity_loss_gpu)
                                                        : loss_tensor_gpu;
@@ -7748,7 +7885,9 @@ namespace lfs::training {
                                    })
                             .error();
                     }
-                    submitLossReadback(total_loss, iter);
+                    submitLossReadback(total_loss, iter, cam,
+                                       nan_trace_enabled ? nan_trace_counts_dev_.ptr<float>() : nullptr,
+                                       nan_trace_numel);
                 }
 
                 if (!in_sparsification && !fastgs_strategy_hooks_at_start) {
@@ -8606,9 +8745,50 @@ namespace lfs::training {
                 // normalization used by the original float decode path.
                 if (gt_image.dtype() == lfs::core::DataType::UInt8) {
                     gt_image.sync_to_stream(training_stream_);
-                    auto gt_image_fp32 = lfs::core::Tensor::empty(
-                        gt_image.shape(), lfs::core::Device::CUDA,
-                        lfs::core::DataType::Float32);
+                    // Experiment (LFS_GT_RING, default on): back the float32 GT
+                    // with a persistent ring allocated outside the memory pool,
+                    // so a premature pool recycle / dangling reference to the GT
+                    // block cannot be overwritten by another stream mid-step.
+                    static const bool gt_ring_enabled = [] {
+                        const char* const v = std::getenv("LFS_GT_RING");
+                        return !(v && *v && *v == '0');
+                    }();
+                    lfs::core::Tensor gt_image_fp32;
+                    if (gt_ring_enabled && gt_ring_slot_bytes_ == 0 && train_dataset_) {
+                        size_t max_elems = 0;
+                        for (const auto& c : train_dataset_->get_cameras()) {
+                            if (c) {
+                                max_elems = std::max(max_elems,
+                                                     static_cast<size_t>(std::max(c->image_width(), 0)) *
+                                                         static_cast<size_t>(std::max(c->image_height(), 0)) * 4);
+                            }
+                        }
+                        max_elems = std::max(max_elems, gt_image.numel());
+                        gt_ring_slot_bytes_ = max_elems * sizeof(float);
+                        for (auto& slot : gt_ring_) {
+                            if (cudaMalloc(&slot, gt_ring_slot_bytes_) != cudaSuccess) {
+                                slot = nullptr;
+                                gt_ring_slot_bytes_ = 0;
+                                LOG_WARN("GT ring: cudaMalloc failed, falling back to pool allocation");
+                                break;
+                            }
+                        }
+                        if (gt_ring_slot_bytes_ != 0) {
+                            LOG_INFO("GT ring: {} slots x {} MiB allocated outside the memory pool",
+                                     gt_ring_.size(), gt_ring_slot_bytes_ >> 20);
+                        }
+                    }
+                    if (gt_ring_enabled && gt_ring_slot_bytes_ >= gt_image.numel() * sizeof(float) &&
+                        gt_ring_[gt_ring_head_] != nullptr) {
+                        gt_image_fp32 = lfs::core::Tensor::from_blob(
+                            gt_ring_[gt_ring_head_], gt_image.shape(), lfs::core::Device::CUDA,
+                            lfs::core::DataType::Float32, training_stream_);
+                        gt_ring_head_ = (gt_ring_head_ + 1) % gt_ring_.size();
+                    } else {
+                        gt_image_fp32 = lfs::core::Tensor::empty(
+                            gt_image.shape(), lfs::core::Device::CUDA,
+                            lfs::core::DataType::Float32);
+                    }
                     lfs::io::cuda::launch_uint8_chw_to_float32_chw(
                         gt_image.ptr<uint8_t>(), gt_image_fp32.ptr<float>(),
                         gt_image.numel(), training_stream_);

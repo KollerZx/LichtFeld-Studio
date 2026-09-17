@@ -38,8 +38,10 @@ namespace lfs::vis {
             const SceneManager* const scene_manager) {
             std::optional<std::shared_lock<std::shared_mutex>> lock;
             if (const auto* tm = scene_manager ? scene_manager->getTrainerManager() : nullptr) {
-                if (const auto* trainer = tm->getTrainer()) {
-                    lock.emplace(trainer->getRenderMutex());
+                if (tm->getTrainer()) {
+                    // Viewer-thread safe: pumps posted work while a training
+                    // step holds the mutex exclusively (see TrainerManager).
+                    lock.emplace(tm->acquireLiveModelReadLock());
                 }
             }
             return lock;
@@ -298,8 +300,8 @@ namespace lfs::vis {
         if (const auto* tm = viewport_interaction_context_.scene_manager
                                  ? viewport_interaction_context_.scene_manager->getTrainerManager()
                                  : nullptr) {
-            if (const auto* trainer = tm->getTrainer()) {
-                render_lock.emplace(trainer->getRenderMutex());
+            if (tm->getTrainer()) {
+                render_lock.emplace(tm->acquireLiveModelReadLock());
             }
         }
 

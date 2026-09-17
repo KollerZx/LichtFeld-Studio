@@ -133,7 +133,7 @@ SLIDER_PROPS = ["lambda_dssim", "init_opacity", "prune_ratio"]
 
 SCRUB_FIELD_DEFS = {
     "lambda_dssim": ScrubFieldSpec(0.0, 1.0, 0.01, "%.3f"),
-    "init_opacity": ScrubFieldSpec(0.01, 1.0, 0.01, "%.3f"),
+    "init_opacity": ScrubFieldSpec(0.01, 0.99, 0.01, "%.3f"),
     "prune_ratio": ScrubFieldSpec(0.0, 1.0, 0.01, "%.3f"),
 }
 

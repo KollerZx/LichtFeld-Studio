@@ -45,6 +45,12 @@ namespace lfs::training {
         constexpr int MRNF_BOUNDS_RECOMPUTE_INTERVAL_REFINES = 5;
         constexpr float MRNF_RAW_OPACITY_PRUNE_THRESHOLD = -5.54126358f; // logit(1 / 255)
         constexpr float MRNF_LOG_MIN_SCALE_THRESHOLD = -23.0258509f;     // log(1e-10)
+        // Fallback used to neutralize a non-finite (NaN/Inf) Gaussian produced by a
+        // split/growth step: small-but-finite scale and low-but-valid opacity, so the
+        // row stays optimizable (or gets pruned on the next pass) instead of poisoning
+        // the forward/backward pass.
+        constexpr float MRNF_SANITIZE_SAFE_LOG_SCALE = -13.8155106f;   // log(1e-6)
+        constexpr float MRNF_SANITIZE_SAFE_RAW_OPACITY = MRNF_RAW_OPACITY_PRUNE_THRESHOLD;
         constexpr float MRNF_SH_C0 = 0.28209479177387814f;
         constexpr float MRNF_EXPLORE_SCORE_FLOOR = 0.05f;
         constexpr float MRNF_PROJECT_NEAR = 0.01f;
@@ -2322,9 +2328,57 @@ namespace lfs::training {
             0,
             nullptr);
 
+        // Defensive guard: the split above can propagate/amplify a non-finite
+        // parent (e.g. from an exploding optimizer step) into both split halves.
+        // Neutralize any resulting NaN/Inf in-place rather than letting it reach
+        // the rasterizer and turn the training loss into NaN/Inf.
+        if (!_sanitize_count_dev.is_valid() || _sanitize_count_dev.numel() < 1) {
+            _sanitize_count_dev = Tensor::zeros({1}, Device::CUDA, DataType::Int32);
+        } else {
+            _sanitize_count_dev.zero_();
+        }
+        kernels::launch_sanitize_gaussians_inplace(
+            _splat_data->means().ptr<float>(),
+            _splat_data->rotation_raw().ptr<float>(),
+            _splat_data->scaling_raw().ptr<float>(),
+            _splat_data->sh0().ptr<float>(),
+            nullptr,
+            _splat_data->opacity_raw().ptr<float>(),
+            split_indices.ptr<int64_t>(),
+            static_cast<int>(K),
+            0,
+            MRNF_SANITIZE_SAFE_LOG_SCALE,
+            MRNF_SANITIZE_SAFE_RAW_OPACITY,
+            _sanitize_count_dev.ptr<int32_t>());
+
         if (use_shN) {
             lfs::training::sh_value::gather_shN_to_canonical(
                 *_splat_data, split_indices, child_shN);
+        }
+
+        kernels::launch_sanitize_gaussians_inplace(
+            child_means.ptr<float>(),
+            child_rotations.ptr<float>(),
+            child_log_scales.ptr<float>(),
+            child_sh0.ptr<float>(),
+            use_shN ? child_shN.ptr<float>() : nullptr,
+            child_raw_opacities.ptr<float>(),
+            nullptr,
+            static_cast<int>(K),
+            use_shN ? static_cast<int>(layout_rest) : 0,
+            MRNF_SANITIZE_SAFE_LOG_SCALE,
+            MRNF_SANITIZE_SAFE_RAW_OPACITY,
+            _sanitize_count_dev.ptr<int32_t>());
+        {
+            int32_t sanitized_total = 0;
+            LFS_CUDA_CHECK_MSG(
+                cudaMemcpy(&sanitized_total, _sanitize_count_dev.ptr<int32_t>(),
+                           sizeof(int32_t), cudaMemcpyDeviceToHost),
+                "MRNF sanitize count D2H");
+            if (sanitized_total > 0) {
+                LOG_WARN("MRNF: sanitized {} non-finite Gaussian row(s) at iter {} (parent+child split candidates)",
+                          sanitized_total, iter);
+            }
         }
 
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Means, split_indices);

@@ -212,7 +212,7 @@ namespace lfs::core::param {
             .strategies({"mcmc"})
             .all_strategies()
             .float_prop(&OptimizationParameters::init_opacity,
-                        "init_opacity", "Init Opacity", d.init_opacity, 0.0f, 1.0f,
+                        "init_opacity", "Init Opacity", d.init_opacity, 0.0f, 0.99f,
                         "Initial opacity for new gaussians")
             .all_strategies()
             .float_prop(&OptimizationParameters::init_scaling,

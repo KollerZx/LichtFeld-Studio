@@ -999,22 +999,55 @@ namespace lfs::training {
         // small pinned ring and polled on later iterations instead of stalling
         // the pipeline with .item(). NaN/Inf detection lags by at most
         // LOSS_RING * LOSS_SYNC_INTERVAL iterations.
-        static constexpr size_t LOSS_RING = 4;
+        static constexpr size_t LOSS_RING = 8;
+        // pinned layout: [0]=loss, [1..3]=non-finite counts of gt/render/loss
+        // (only written when LFS_NAN_TRACE is enabled, see has_trace).
+        static constexpr size_t LOSS_SLOT_FLOATS = 4;
         struct LossReadbackSlot {
             float* pinned = nullptr;
             cudaEvent_t done = nullptr;
             int iter = 0;
             bool in_flight = false;
+            bool has_trace = false;
+            std::array<size_t, 3> trace_numel{}; // element counts of gt/render/loss (plausibility bound)
+            std::string image_name; // camera image of the sampled step (NaN diagnostics)
         };
+        // Persistent device accumulator [3] for the async NaN trace (gt/render/loss
+        // non-finite counts); zeroed per traced step, read back through the ring.
+        lfs::core::Tensor nan_trace_counts_dev_;
+        // Persistent float32 ground-truth ring (raw cudaMalloc, outside the pool),
+        // see LFS_GT_RING in the training loop. Freed in the destructor.
+        std::array<void*, 6> gt_ring_{};
+        size_t gt_ring_slot_bytes_ = 0;
+        size_t gt_ring_head_ = 0;
         std::array<LossReadbackSlot, LOSS_RING> loss_slots_{};
         size_t loss_slot_head_ = 0;
+
+        // Ring of the most recent (iteration, camera image) pairs so a NaN/Inf
+        // loss — which is only detected LOSS_RING*LOSS_SYNC_INTERVAL iterations
+        // later — can be traced back to the views that were trained meanwhile.
+        static constexpr size_t RECENT_STEP_CAMERAS = 48;
+        std::array<std::pair<int, std::string>, RECENT_STEP_CAMERAS> recent_step_cameras_{};
+        size_t recent_step_camera_head_ = 0;
+        void recordStepCamera(int iter, const lfs::core::Camera* cam);
+        // Builds a human-readable diagnostic for a NaN/Inf loss: which images were
+        // trained around the failing iteration and how many non-finite values each
+        // model parameter tensor holds (finite model => forward/loss-side NaN,
+        // corrupted model => optimizer/densification-side NaN).
+        std::string describeNonFiniteLossState(int failed_iter);
 
         // Always-compiled fault-injection seam used only by the OOM
         // recovery tests. Empty in production, where cudaDeviceSynchronize is
         // called directly.
         std::function<cudaError_t()> recovery_sync_for_testing_;
 
-        void submitLossReadback(const lfs::core::Tensor& total_loss, int iter);
+        // trace_counts_dev: optional device pointer to three floats (non-finite
+        // counts of gt / render / loss) copied D2H alongside the loss, async;
+        // trace_numel gives the element count of each inspected tensor.
+        void submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
+                                const lfs::core::Camera* cam,
+                                const float* trace_counts_dev = nullptr,
+                                std::array<size_t, 3> trace_numel = {});
         std::expected<void, std::string> harvestLossReadbacks(bool drain, bool in_controller_phase);
 
         // Python control scripts (file paths) to execute before training starts

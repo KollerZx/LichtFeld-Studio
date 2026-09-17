@@ -68,6 +68,61 @@ namespace lfs::training::kernels {
         cudaStream_t stream = nullptr);
 
     /**
+     * @brief Replace non-finite (NaN/Inf) Gaussian rows with a safe, near-invisible
+     * fallback Gaussian in-place.
+     *
+     * Defensive guard against numerical blow-ups (e.g. an exploding optimizer step)
+     * that would otherwise propagate into the rasterizer and turn the training loss
+     * into NaN/Inf, aborting the run. Any row where at least one of position,
+     * rotation, scale, opacity, sh0, or shN is non-finite is replaced with an
+     * identity rotation, a small-but-finite scale, a low opacity, and zeroed SH
+     * coefficients, so the Gaussian stays optimizable (or gets pruned on the next
+     * prune pass) instead of corrupting the forward/backward pass.
+     *
+     * @param positions Positions [count, 3] (or [N, 3] when indices is non-null)
+     * @param rotations Rotations [count, 4]
+     * @param scales Log-space scales [count, 3]
+     * @param sh0 SH degree 0 [count, 3]
+     * @param shN SH higher degrees [count, shN_dim], may be nullptr when shN_dim == 0
+     * @param opacities Raw (logit-space) opacities [count, 1]
+     * @param indices Optional gather indices [count]; when null, rows are addressed
+     * directly by thread index (use this for compact/linear "child" buffers; pass the
+     * source indices to sanitize existing rows in a larger buffer in-place)
+     * @param count Number of rows to check
+     * @param shN_dim SH higher-degree dimension (0 if shN is unused)
+     * @param safe_log_scale Log-space scale written to a sanitized row
+     * @param safe_raw_opacity Raw (logit-space) opacity written to a sanitized row
+     * @param sanitized_count Optional device int32 accumulator incremented once per
+     * sanitized row (atomic add); pass nullptr to skip counting
+     * @param stream CUDA stream
+     */
+    void launch_sanitize_gaussians_inplace(
+        float* positions,
+        float* rotations,
+        float* scales,
+        float* sh0,
+        float* shN,
+        float* opacities,
+        const int64_t* indices,
+        int count,
+        int shN_dim,
+        float safe_log_scale,
+        float safe_raw_opacity,
+        int* sanitized_count,
+        cudaStream_t stream = nullptr);
+
+    /**
+     * @brief Accumulate the number of non-finite (NaN/Inf) values of a contiguous
+     * float buffer into *out_count (atomic add of 1.0f per bad value). The caller
+     * zeroes *out_count beforehand. Diagnostic helper (NaN tracing); no host sync.
+     */
+    void launch_count_non_finite(
+        const float* data,
+        size_t count,
+        float* out_count,
+        cudaStream_t stream = nullptr);
+
+    /**
      * fused free-slot write.
      *
      * For each i in [0, n_fill): writes child row i into param row target_indices[i]
