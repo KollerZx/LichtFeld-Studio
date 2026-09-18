@@ -265,3 +265,13 @@ cd "$lfs"
 VCPKG_BINARY_SOURCES='clear;default,write' cmake -B build -G Ninja --fresh
 cmake --build build -j"$(nproc)"
 ```
+
+**"CUDA toolkit mismatch: nvcc comes from ... but CUDA libraries were resolved from ..."** - The host has more than one CUDA installation (typically a distro package such as Ubuntu's `nvidia-cuda-toolkit` 11.x in `/usr/lib`, plus a newer toolkit in `/usr/local/cuda-*`), and an existing `build/` cache still points at the wrong one. Before this check existed the symptom was silent: `nvjpeg_ext` linked against the old nvJPEG, registered no decoders, and every JPEG decode logged `CODEC_UNSUPPORTED` and fell back to CPU. Reconfigure with a fresh cache so the libraries are re-resolved from the toolkit that `nvcc` belongs to. `--fresh` also drops any compiler choice from the cache, so repeat those flags if you rely on them:
+
+```bash
+cmake --preset build --fresh \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc   # if the nvcc on PATH is the old one
+cmake --build build -j"$(nproc)"
+```
+
+A clean clone needs no extra flags: `CUDAToolkit_ROOT` is derived from the selected `nvcc` automatically. Removing the conflicting distro package (`sudo apt remove nvidia-cuda-toolkit`) also resolves it; containers are unaffected since they only need the host driver.
