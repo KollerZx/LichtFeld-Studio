@@ -208,15 +208,17 @@ namespace lfs::io {
 
             for (std::filesystem::directory_iterator it(ext_dir, ec), end; !ec && it != end; it.increment(ec)) {
                 const auto& path = it->path();
-                std::string ext = path.extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                std::string name = lfs::core::path_to_utf8(path.filename());
+                std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
 #ifdef _WIN32
-                if (ext == ".dll") {
+                if (name.ends_with(".dll")) {
                     dll_files.push_back(lfs::core::path_to_utf8(path.filename()));
                 }
 #else
-                if (ext == ".so") {
+                // Versioned names (libnvjpeg_ext.so.0.9.0) are what the build copies
+                // here and what nvImageCodec loads; path::extension() would see ".0".
+                if (name.ends_with(".so") || name.find(".so.") != std::string::npos) {
                     dll_files.push_back(lfs::core::path_to_utf8(path.filename()));
                 }
 #endif
@@ -267,6 +269,39 @@ namespace lfs::io {
                 }
             }
 #endif
+        }
+
+        int nvimgcodec_debug_callback(const nvimgcodecDebugMessageSeverity_t severity,
+                                      const nvimgcodecDebugMessageCategory_t /*category*/,
+                                      const nvimgcodecDebugMessageData_t* data,
+                                      void* /*user_data*/) {
+            if (!data || !data->message) {
+                return 0;
+            }
+            const char* codec = data->codec ? data->codec : "framework";
+            if (severity >= NVIMGCODEC_DEBUG_MESSAGE_SEVERITY_ERROR) {
+                LOG_ERROR("[nvImageCodec:{}] {}", codec, data->message);
+            } else {
+                LOG_WARN("[nvImageCodec:{}] {}", codec, data->message);
+            }
+            return 0;
+        }
+
+        // Surfaces extension-load problems (e.g. "nvJPEG version X is older than
+        // minimum required ... Decoders and encoders will not be registered")
+        // that otherwise only show up later as CODEC_UNSUPPORTED on every image.
+        const nvimgcodecDebugMessengerDesc_t& nvimgcodec_debug_messenger_desc() {
+            static const nvimgcodecDebugMessengerDesc_t desc{
+                NVIMGCODEC_STRUCTURE_TYPE_DEBUG_MESSENGER_DESC,
+                sizeof(nvimgcodecDebugMessengerDesc_t),
+                nullptr,
+                NVIMGCODEC_DEBUG_MESSAGE_SEVERITY_WARNING |
+                    NVIMGCODEC_DEBUG_MESSAGE_SEVERITY_ERROR |
+                    NVIMGCODEC_DEBUG_MESSAGE_SEVERITY_FATAL,
+                NVIMGCODEC_DEBUG_MESSAGE_CATEGORY_ALL,
+                nvimgcodec_debug_callback,
+                nullptr};
+            return desc;
         }
 
         void log_decode_failure(nvimgcodecProcessingStatus_t status,
@@ -1034,7 +1069,14 @@ namespace lfs::io {
         const nvimgcodecInstanceCreateInfo_t create_info{
             NVIMGCODEC_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             sizeof(nvimgcodecInstanceCreateInfo_t),
-            nullptr, 1, 1, extensions_path_ptr, 0, nullptr, 0, 0};
+            nullptr,
+            1, // load_builtin_modules
+            1, // load_extension_modules
+            extensions_path_ptr,
+            1, // create_debug_messenger
+            &nvimgcodec_debug_messenger_desc(),
+            0,
+            0};
 
         auto status = nvimgcodecInstanceCreate(&impl_->instance, &create_info);
         if (status != NVIMGCODEC_STATUS_SUCCESS) {

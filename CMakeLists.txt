@@ -420,7 +420,37 @@ endif()
 message(STATUS "Runtime GPU floor: SM ${LFS_RUNTIME_MIN_SM}")
 
 enable_language(CUDA)
+
+# FindCUDAToolkit locates each library with find_library(), which consults the
+# system library directories before the toolkit's own lib dir. On hosts that also
+# carry a distro CUDA package (e.g. Ubuntu's nvidia-cuda-toolkit 11.x in /usr/lib)
+# this silently links an older cudart/nvjpeg than the nvcc being used. Symptom:
+# nvjpeg_ext loads but registers no decoders ("nvJPEG version 11.5.4 is older
+# than minimum required"), so every JPEG decode reports CODEC_UNSUPPORTED and
+# falls back to CPU. Pin the search to the compiler's toolkit unless the user
+# chose one explicitly, and refuse to configure against a mismatched toolkit.
+if(NOT CUDAToolkit_ROOT AND NOT DEFINED ENV{CUDAToolkit_ROOT} AND CMAKE_CUDA_COMPILER_TOOLKIT_ROOT)
+    set(CUDAToolkit_ROOT "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}")
+endif()
 find_package(CUDAToolkit 12.8 REQUIRED)
+if(CMAKE_CUDA_COMPILER_TOOLKIT_ROOT AND CUDAToolkit_LIBRARY_DIR)
+    file(REAL_PATH "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}" _lfs_cuda_toolkit_root)
+    file(REAL_PATH "${CUDAToolkit_LIBRARY_DIR}" _lfs_cuda_library_dir)
+    cmake_path(IS_PREFIX _lfs_cuda_toolkit_root "${_lfs_cuda_library_dir}" NORMALIZE _lfs_cuda_libs_from_toolkit)
+    if(NOT _lfs_cuda_libs_from_toolkit)
+        message(FATAL_ERROR
+            "CUDA toolkit mismatch: nvcc comes from '${_lfs_cuda_toolkit_root}' but "
+            "CUDA libraries were resolved from '${_lfs_cuda_library_dir}' "
+            "(cudart: '${CUDA_cudart_LIBRARY}'). This usually means a distro CUDA "
+            "package is shadowing the toolkit. Reconfigure with "
+            "-DCUDAToolkit_ROOT=${_lfs_cuda_toolkit_root} (use --fresh to drop the "
+            "cached CUDA_*_LIBRARY entries) or remove the conflicting package.")
+    endif()
+    unset(_lfs_cuda_toolkit_root)
+    unset(_lfs_cuda_library_dir)
+    unset(_lfs_cuda_libs_from_toolkit)
+endif()
+message(STATUS "CUDA toolkit ${CUDAToolkit_VERSION}: libraries from ${CUDAToolkit_LIBRARY_DIR}")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 if(WIN32)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 221,1394,1388 -Xcompiler=/wd4267 -Xcompiler=/Zc:preprocessor")
